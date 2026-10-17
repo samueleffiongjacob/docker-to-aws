@@ -43,8 +43,8 @@
             mode: "0644"
 
         - name: Remove dangling images
-          community.docker.docker_prune:
-            images: true
+          ansible.builtin.command: docker image prune -f
+          changed_when: false
 
       rescue:
         - name: Roll back to the previous release
