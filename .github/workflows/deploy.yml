@@ -1,0 +1,157 @@
+name: Deploy to EC2
+
+# Every push to main ships; workflow_dispatch re-runs the same deploy by hand.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Only ever one deploy in flight. Not cancel-in-progress: killing a half-applied
+# rollout on the box is worse than letting it finish.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build & push images
+    runs-on: ubuntu-latest
+
+    outputs:
+      backend_image: ${{ steps.images.outputs.backend }}
+      frontend_image: ${{ steps.images.outputs.frontend }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image references
+        id: images
+        run: |
+          # GHCR requires a lowercase path; the owner/repo casing is not guaranteed.
+          repo="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+          echo "backend=${REGISTRY}/${repo}/backend:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "frontend=${REGISTRY}/${repo}/frontend:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.images.outputs.backend }}
+            ${{ env.REGISTRY }}/${{ steps.images.outputs.repo }}/backend:latest
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.images.outputs.frontend }}
+            ${{ env.REGISTRY }}/${{ steps.images.outputs.repo }}/frontend:latest
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      # Needed for the ansible/ project and the deploy/ compose file it uploads.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Strip stray newlines/whitespace that creep into pasted secrets.
+      - name: Resolve deploy inputs
+        id: cfg
+        env:
+          RAW_DIR: ${{ secrets.EC2_TARGET_DIR }}
+          RAW_HOST: ${{ secrets.EC2_HOST }}
+          RAW_USER: ${{ secrets.EC2_USERNAME }}
+          RAW_PORT: ${{ secrets.EC2_PORT }}
+        run: |
+          clean() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          dir="$(clean "$RAW_DIR")"
+          {
+            echo "dir=${dir:-/home/ubuntu/app}"
+            echo "host=$(clean "$RAW_HOST")"
+            echo "user=$(clean "$RAW_USER")"
+            echo "port=$(clean "$RAW_PORT")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install Ansible
+        run: |
+          pipx install "ansible-core>=2.16,<2.20"
+          ansible-galaxy collection install -r ansible/requirements.yml
+
+      - name: Run Ansible deploy
+        working-directory: ansible
+        env:
+          EC2_HOST: ${{ steps.cfg.outputs.host }}
+          EC2_USERNAME: ${{ steps.cfg.outputs.user }}
+          EC2_PORT: ${{ steps.cfg.outputs.port }}
+          EC2_SSH_KEY_FILE: ${{ runner.temp }}/key.pem
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          # Secrets travel as env vars, never interpolated into the script body.
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+          APP_DIR: ${{ steps.cfg.outputs.dir }}
+          CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          VAULT_FILE="$RUNNER_TEMP/vault-pass"
+          trap 'rm -f "$EC2_SSH_KEY_FILE" "$VAULT_FILE"' EXIT
+
+          printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > "$EC2_SSH_KEY_FILE"
+          printf '%s' "$ANSIBLE_VAULT_PASSWORD" > "$VAULT_FILE"
+
+          # Same lowercase owner/repo that the build job pushed to.
+          repo="${GITHUB_REPOSITORY,,}"
+
+          # JSON extra-vars keep values with spaces/commas (CORS_ORIGINS) intact.
+          extra="$(jq -nc \
+            --arg tag "$GITHUB_SHA" \
+            --arg repo "$repo" \
+            --arg dir "$APP_DIR" \
+            --arg cors "$CORS_ORIGINS" \
+            '{image_tag: $tag, image_repo: $repo, app_dir: $dir}
+             + (if $cors != "" then {cors_origins: $cors} else {} end)')"
+
+          ansible-playbook deploy.yml -e "$extra" --vault-password-file "$VAULT_FILE"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed to production"
+            echo ""
+            echo "| Service | Image |"
+            echo "| --- | --- |"
+            echo "| backend | \`${{ needs.build.outputs.backend_image }}\` |"
+            echo "| frontend | \`${{ needs.build.outputs.frontend_image }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
