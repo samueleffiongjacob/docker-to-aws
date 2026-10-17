@@ -1,21 +1,24 @@
-# ---- Non-secret production settings (mirrors env: / vars: in deploy.yaml) ----
-app_dir: /home/ubuntu/app          # EC2_TARGET_DIR
+# Everything is read from environment variables, which GitHub Actions fills from
+# repo secrets. Nothing sensitive or environment-specific is stored in this repo.
+# To run by hand, export the same variable names first.
+
+app_dir: "{{ lookup('env', 'APP_DIR') | default('/home/ubuntu/app', true) }}"
 registry: ghcr.io
-image_repo: owner/repo             # lowercase "owner/repo" of your GitHub repository
+image_repo: "{{ lookup('env', 'IMAGE_REPO') }}"          # lowercase owner/repo
 
-postgres_host_port: 5433
-backend_host_port: 8000
-frontend_host_port: 3000
-cors_origins: "http://localhost:3000"   # GitHub variable CORS_ORIGINS
-log_level: INFO
+postgres_user: "{{ lookup('env', 'POSTGRES_USER') }}"
+postgres_password: "{{ lookup('env', 'POSTGRES_PASSWORD') }}"
+postgres_db: "{{ lookup('env', 'POSTGRES_DB') }}"
+cors_origins: "{{ lookup('env', 'CORS_ORIGINS') }}"
 
-# ---- Secrets come from vault.yml (encrypted) ----
-postgres_user: "{{ vault_postgres_user }}"
-postgres_password: "{{ vault_postgres_password }}"
-postgres_db: "{{ vault_postgres_db }}"
-ghcr_user: "{{ vault_ghcr_user }}"
-ghcr_token: "{{ vault_ghcr_token }}"   # PAT with read:packages (GITHUB_TOKEN dies after the run)
+ghcr_user: "{{ lookup('env', 'GHCR_USER') }}"
+ghcr_token: "{{ lookup('env', 'GHCR_TOKEN') }}"
 
-# ---- Derived: image_tag is passed at run time (-e image_tag=<sha>) ----
+# Optional overrides (defaults match your old workflow)
+postgres_host_port: "{{ lookup('env', 'POSTGRES_HOST_PORT') | default('5433', true) }}"
+backend_host_port: "{{ lookup('env', 'BACKEND_HOST_PORT') | default('8000', true) }}"
+frontend_host_port: "{{ lookup('env', 'FRONTEND_HOST_PORT') | default('3000', true) }}"
+log_level: "{{ lookup('env', 'LOG_LEVEL') | default('INFO', true) }}"
+
 backend_image: "{{ registry }}/{{ image_repo }}/backend"
 frontend_image: "{{ registry }}/{{ image_repo }}/frontend"

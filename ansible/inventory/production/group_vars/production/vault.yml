@@ -1,6 +1,0 @@
-# Replace the values, then encrypt:  ansible-vault encrypt inventory/production/group_vars/production/vault.yml
-vault_postgres_user: CHANGE_ME
-vault_postgres_password: CHANGE_ME      # avoid single quotes in this value
-vault_postgres_db: CHANGE_ME
-vault_ghcr_user: your-github-username
-vault_ghcr_token: ghp_CHANGE_ME

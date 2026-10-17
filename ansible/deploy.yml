@@ -10,6 +10,23 @@
         that: image_tag is defined and image_tag | length > 0
         fail_msg: "Pass -e image_tag=<git sha>"
 
+    - name: Require every setting that comes from GitHub secrets
+      ansible.builtin.assert:
+        that:
+          - image_repo | length > 0
+          - postgres_user | length > 0
+          - postgres_password | length > 0
+          - postgres_db | length > 0
+          - cors_origins | length > 0
+          - ghcr_user | length > 0
+          - ghcr_token | length > 0
+          - "\"'\" not in postgres_password"
+        fail_msg: >-
+          A required value is empty (or POSTGRES_PASSWORD contains a single quote).
+          Check the repo secrets: POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
+          CORS_ORIGINS, and that IMAGE_REPO / GHCR_USER / GHCR_TOKEN reach the step.
+        quiet: true
+
     - name: Read the previously deployed tag (for rollback)
       ansible.builtin.slurp:
         src: "{{ app_dir }}/.deployed_tag"
