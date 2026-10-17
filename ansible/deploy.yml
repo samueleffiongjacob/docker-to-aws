@@ -1,5 +1,5 @@
 # Step 2: ship a specific image tag.
-#   ansible-playbook deploy.yml -e image_tag=<git-sha> --ask-vault-pass
+#   ansible-playbook deploy.yml -e image_tag=<git-sha>
 - name: Deploy application
   hosts: production
   tags: [deploy]
@@ -26,6 +26,26 @@
           Check the repo secrets: POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
           CORS_ORIGINS, and that IMAGE_REPO / GHCR_USER / GHCR_TOKEN reach the step.
         quiet: true
+
+    - name: Check Docker and Compose v2 are usable by this user
+      ansible.builtin.shell: docker info >/dev/null 2>&1 && docker compose version >/dev/null 2>&1
+      register: docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stop with a clear message if the host isn't ready
+      ansible.builtin.assert:
+        that: docker_check.rc == 0
+        fail_msg: >-
+          Docker (or the Compose v2 plugin) is missing, or {{ ansible_user }} is not in the
+          docker group. Run provision.yml once, then deploy again.
+        quiet: true
+
+    - name: Make sure the app directory exists
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0750"
 
     - name: Read the previously deployed tag (for rollback)
       ansible.builtin.slurp:
@@ -64,6 +84,18 @@
           changed_when: false
 
       rescue:
+        - name: Capture recent container logs
+          ansible.builtin.command: docker compose -f docker-compose.prod.yml logs --no-color --tail=120
+          args:
+            chdir: "{{ app_dir }}"
+          register: failure_logs
+          changed_when: false
+          failed_when: false
+
+        - name: Show the logs
+          ansible.builtin.debug:
+            msg: "{{ failure_logs.stdout_lines | default([]) }}"
+
         - name: Roll back to the previous release
           ansible.builtin.include_tasks: tasks/apply.yml
           vars:

@@ -158,8 +158,9 @@ jobs:
             '{image_tag: $tag, image_repo: $repo, app_dir: $dir}
              + (if $cors != "" then {cors_origins: $cors} else {} end)')"
 
-          ansible-playbook deploy.yml -e "$extra" --vault-password-file "$VAULT_FILE"
-
+          # site.yml = provision.yml (Docker etc., idempotent) then deploy.yml.
+          # A brand-new server is fully set up on the first run.
+          ansible-playbook site.yml -e "image_tag=$GITHUB_SHA"
       - name: Summary
         run: |
           {

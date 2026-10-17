@@ -20,6 +20,13 @@
         cache_valid_time: 3600
         lock_timeout: 120
 
+    # A Docker repo added by hand or by an older playbook (docker.list) would clash
+    # with the one below and make `apt update` fail on conflicting Signed-By values.
+    - name: Remove any legacy Docker apt source
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/docker.list
+        state: absent
+    
     #apt_repository is deprecated and ansible-core will remove it. I switched to deb822_repository, and added python3-debian to the prerequisites because that module needs it.
 
     # - name: Add Docker's GPG key
