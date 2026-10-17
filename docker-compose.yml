@@ -39,7 +39,7 @@ services:
     command: >
       sh -c "uv run alembic upgrade head && uv run python -m biodata"
     ports:
-      - "${BACKEND_HOST_PORT:-8000}:8000"
+      - "${BACKEND_HOST_PORT:-8001}:8000"
     healthcheck:
       test:
         - CMD
