@@ -149,15 +149,6 @@ jobs:
           # Same lowercase owner/repo that the build job pushed to.
           export IMAGE_REPO="${GITHUB_REPOSITORY,,}"
 
-          # JSON extra-vars keep values with spaces/commas (CORS_ORIGINS) intact.
-          extra="$(jq -nc \
-            --arg tag "$GITHUB_SHA" \
-            --arg IMAGE_REPO "$IMAGE_REPO" \
-            --arg dir "$APP_DIR" \
-            --arg cors "$CORS_ORIGINS" \
-            '{image_tag: $tag, image_repo: $repo, app_dir: $dir}
-             + (if $cors != "" then {cors_origins: $cors} else {} end)')"
-
           # site.yml = provision.yml (Docker etc., idempotent) then deploy.yml.
           # A brand-new server is fully set up on the first run.
           ansible-playbook site.yml -e "image_tag=$GITHUB_SHA"
