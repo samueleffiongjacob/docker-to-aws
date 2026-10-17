@@ -91,7 +91,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -146,6 +146,12 @@ jobs:
     needs: [backend, frontend, docker]
     permissions:
       contents: read
+    env:
+      # The root docker-compose.yml publishes the backend on host port 8001 by
+      # default, but every check below talks to 8000. Pin the ports here so CI
+      # does not depend on those local-dev defaults.
+      BACKEND_HOST_PORT: "8000"
+      FRONTEND_HOST_PORT: "3000"
 
     steps:
       - name: Checkout
@@ -155,28 +161,46 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Start the stack
-        run: docker compose up -d --build
+        run: |
+          docker compose up -d --build
+          docker compose ps -a
 
+      # Fails fast, with the container's own logs, if the backend has already died,
+      # instead of printing "connection refused" for two minutes.
       - name: Wait for backend /health
         run: |
+          state="unknown"
           for i in $(seq 1 60); do
-            if curl -fsS http://localhost:8000/health | grep -q '"status":"ok"'; then
+            if curl -fs http://localhost:8000/health 2>/dev/null | grep -q '"status":"ok"'; then
               echo "backend healthy"; exit 0
             fi
+            cid="$(docker compose ps -a -q backend | head -n1)"
+            state="$(docker inspect -f '{{.State.Status}} (exit {{.State.ExitCode}})' "$cid" 2>/dev/null || echo unknown)"
+            case "$state" in
+              exited*|dead*)
+                echo "backend container is not running: $state" >&2
+                docker compose ps -a
+                docker compose logs --no-color --timestamps --tail=200 backend
+                exit 1 ;;
+            esac
             sleep 2
           done
-          echo "backend did not become healthy in time" >&2
+          echo "backend did not become healthy in time (last state: $state)" >&2
+          docker compose ps -a
+          docker compose logs --no-color --timestamps --tail=200 backend
           exit 1
 
       - name: Wait for frontend
         run: |
           for i in $(seq 1 60); do
-            if curl -fsS -o /dev/null http://localhost:3000; then
+            if curl -fs -o /dev/null http://localhost:3000 2>/dev/null; then
               echo "frontend healthy"; exit 0
             fi
             sleep 2
           done
           echo "frontend did not become healthy in time" >&2
+          docker compose ps -a
+          docker compose logs --no-color --timestamps --tail=200 frontend
           exit 1
 
       - name: Idempotent replay check (POST twice, same Idempotency-Key)
@@ -232,7 +256,9 @@ jobs:
 
       - name: Dump logs on failure
         if: failure()
-        run: docker compose logs --no-color --tail=400
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --timestamps --tail=400
 
       - name: Tear down
         if: always()
