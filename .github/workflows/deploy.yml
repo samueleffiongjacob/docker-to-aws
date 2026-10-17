@@ -135,7 +135,8 @@ jobs:
           POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
-          CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+          CORS_ORIGINS: ${{ secrets.CORS_ORIGINS || vars.CORS_ORIGINS }}
+
           # Registry login: built-in token by default; add GHCR_USERNAME + GHCR_PAT
           # secrets only if you want a long-lived token that works outside Actions.
           GHCR_USER: ${{ secrets.GHCR_USERNAME || github.actor }}
@@ -143,6 +144,15 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          # Fail fast, naming (never printing) any secret that is empty.
+          missing=""
+          for v in EC2_HOST EC2_USERNAME EC2_SSH_KEY POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB CORS_ORIGINS GHCR_TOKEN; do
+            [ -n "${!v:-}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=Missing secrets::These are empty:$missing. Add them under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
           trap 'rm -f "$EC2_SSH_KEY_FILE"' EXIT
           printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > "$EC2_SSH_KEY_FILE"
 

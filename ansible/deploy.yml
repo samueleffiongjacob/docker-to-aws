@@ -10,21 +10,24 @@
         that: image_tag is defined and image_tag | length > 0
         fail_msg: "Pass -e image_tag=<git sha>"
 
-    - name: Require every setting that comes from GitHub secrets
+    - name: Work out which required settings are empty
+      ansible.builtin.set_fact:
+        missing_settings: >-
+          {{ {'IMAGE_REPO': image_repo, 'POSTGRES_USER': postgres_user,
+              'POSTGRES_PASSWORD': postgres_password, 'POSTGRES_DB': postgres_db,
+              'CORS_ORIGINS': cors_origins, 'GHCR_USER': ghcr_user, 'GHCR_TOKEN': ghcr_token}
+             | dict2items | selectattr('value', 'equalto', '') | map(attribute='key') | list }}
+      no_log: true
+
+    - name: Stop if a setting is empty or the password has a single quote
       ansible.builtin.assert:
         that:
-          - image_repo | length > 0
-          - postgres_user | length > 0
-          - postgres_password | length > 0
-          - postgres_db | length > 0
-          - cors_origins | length > 0
-          - ghcr_user | length > 0
-          - ghcr_token | length > 0
+          - missing_settings | length == 0
           - "\"'\" not in postgres_password"
         fail_msg: >-
-          A required value is empty (or POSTGRES_PASSWORD contains a single quote).
-          Check the repo secrets: POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
-          CORS_ORIGINS, and that IMAGE_REPO / GHCR_USER / GHCR_TOKEN reach the step.
+          {{ ('Empty settings: ' ~ (missing_settings | join(', ')) ~ '. Add them as repo secrets (names must match exactly).')
+             if missing_settings | length > 0
+             else 'POSTGRES_PASSWORD contains a single quote (\'), which breaks the .env file. Use a password without one.' }}
         quiet: true
 
     - name: Check Docker and Compose v2 are usable by this user
