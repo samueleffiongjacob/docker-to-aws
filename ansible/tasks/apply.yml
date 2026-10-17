@@ -1,0 +1,24 @@
+# Renders .env for `release_tag`, logs in to GHCR, pulls and (re)starts the stack.
+- name: Write .env for {{ release_tag }}
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ app_dir }}/.env"
+    mode: "0600"
+  no_log: true
+
+- name: Log in to GHCR
+  ansible.builtin.command: docker login {{ registry }} -u {{ ghcr_user }} --password-stdin
+  args:
+    stdin: "{{ ghcr_token }}"
+  no_log: true
+  changed_when: false
+
+- name: Pull images and start the stack
+  community.docker.docker_compose_v2:
+    project_src: "{{ app_dir }}"
+    files: [docker-compose.prod.yml]
+    pull: always
+    state: present
+    remove_orphans: true
+    wait: true
+    wait_timeout: 180

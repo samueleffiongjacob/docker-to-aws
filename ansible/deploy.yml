@@ -1,0 +1,60 @@
+# Step 2: ship a specific image tag.
+#   ansible-playbook deploy.yml -e image_tag=<git-sha> --ask-vault-pass
+- name: Deploy application
+  hosts: production
+  tags: [deploy]
+
+  tasks:
+    - name: Require an image tag (the commit SHA built by CI)
+      ansible.builtin.assert:
+        that: image_tag is defined and image_tag | length > 0
+        fail_msg: "Pass -e image_tag=<git sha>"
+
+    - name: Read the previously deployed tag (for rollback)
+      ansible.builtin.slurp:
+        src: "{{ app_dir }}/.deployed_tag"
+      register: previous_tag_file
+      failed_when: false
+
+    - name: Remember the previous tag
+      ansible.builtin.set_fact:
+        previous_tag: "{{ (previous_tag_file.content | b64decode | trim) if previous_tag_file.content is defined else '' }}"
+
+    - name: Upload compose file
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../deploy/docker-compose.prod.yml"
+        dest: "{{ app_dir }}/docker-compose.prod.yml"
+        mode: "0644"
+
+    - name: Release
+      block:
+        - name: Apply the new release
+          ansible.builtin.include_tasks: tasks/apply.yml
+          vars:
+            release_tag: "{{ image_tag }}"
+
+        - name: Verify the release
+          ansible.builtin.include_tasks: tasks/verify.yml
+
+        - name: Record the deployed tag
+          ansible.builtin.copy:
+            content: "{{ image_tag }}\n"
+            dest: "{{ app_dir }}/.deployed_tag"
+            mode: "0644"
+
+        - name: Remove dangling images
+          community.docker.docker_prune:
+            images: true
+
+      rescue:
+        - name: Roll back to the previous release
+          ansible.builtin.include_tasks: tasks/apply.yml
+          vars:
+            release_tag: "{{ previous_tag }}"
+          when: previous_tag | length > 0
+
+        - name: Fail the deploy
+          ansible.builtin.fail:
+            msg: >-
+              Deploy of {{ image_tag }} failed.
+              {{ ('Rolled back to ' ~ previous_tag) if previous_tag | length > 0 else 'No previous release to roll back to.' }}

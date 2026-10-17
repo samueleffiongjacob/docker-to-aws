@@ -1,0 +1,175 @@
+name: Deploy to EC2
+
+# Every push to main ships; workflow_dispatch re-runs the same deploy by hand.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Only ever one deploy in flight. Not cancel-in-progress: killing a half-applied
+# rollout on the box is worse than letting it finish.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+# packages: write is what lets GITHUB_TOKEN push images to GHCR.
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build & push images
+    runs-on: ubuntu-latest
+
+    # Image refs are computed once here and consumed by the deploy job below.
+    outputs:
+      backend_image: ${{ steps.images.outputs.backend }}
+      frontend_image: ${{ steps.images.outputs.frontend }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image references
+        id: images
+        run: |
+          # GHCR requires a lowercase path; the owner/repo casing is not guaranteed.
+          repo="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+          echo "backend=${REGISTRY}/${repo}/backend:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "frontend=${REGISTRY}/${repo}/frontend:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+
+      # Buildx is required for the type=gha layer cache used by the build steps.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          # Immutable :sha tag is what the host deploys; :latest is a convenience
+          # pointer for humans pulling by hand.
+          tags: |
+            ${{ steps.images.outputs.backend }}
+            ${{ env.REGISTRY }}/${{ steps.images.outputs.repo }}/backend:latest
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.images.outputs.frontend }}
+            ${{ env.REGISTRY }}/${{ steps.images.outputs.repo }}/frontend:latest
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+
+    # Production environment scopes the deploy secrets and any required approval.
+    environment: production
+
+    steps:
+      # Only needed for the deploy/ files the next step uploads.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Secrets pasted into the GitHub UI routinely pick up trailing newlines,
+      # which silently corrupt every path and host built from them. Strip them
+      # once here rather than debugging "$'/home/ubuntu/app\n\n\n'" later.
+      - name: Resolve deploy inputs
+        id: cfg
+        env:
+          RAW_DIR: ${{ secrets.EC2_TARGET_DIR }}
+          RAW_HOST: ${{ secrets.EC2_HOST }}
+          RAW_USER: ${{ secrets.EC2_USERNAME }}
+          RAW_PORT: ${{ secrets.EC2_PORT }}
+        run: |
+          clean() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          dir="$(clean "$RAW_DIR")"
+          {
+            echo "dir=${dir:-/home/ubuntu/app}"
+            echo "host=$(clean "$RAW_HOST")"
+            echo "user=$(clean "$RAW_USER")"
+            echo "port=$(clean "$RAW_PORT")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Copy deploy files to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ steps.cfg.outputs.host }}
+          username: ${{ steps.cfg.outputs.user }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ steps.cfg.outputs.port }}
+          source: "deploy/docker-compose.prod.yml,deploy/deploy.sh"
+          target: ${{ steps.cfg.outputs.dir }}
+          # Strips the deploy/ prefix so both files land directly in the target dir.
+          strip_components: 1
+          overwrite: true
+
+      - name: Run deployment
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ steps.cfg.outputs.host }}
+          username: ${{ steps.cfg.outputs.user }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ steps.cfg.outputs.port }}
+          # Values are passed as env vars rather than interpolated into the script
+          # body, so secrets never end up in the command line or shell history.
+          envs: APP_DIR,REGISTRY,REGISTRY_USER,REGISTRY_TOKEN,BACKEND_IMAGE,FRONTEND_IMAGE,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,POSTGRES_HOST_PORT,BACKEND_HOST_PORT,FRONTEND_HOST_PORT,CORS_ORIGINS,LOG_LEVEL
+          script: |
+            set -eu
+            : "${APP_DIR:?APP_DIR is empty - check the EC2_TARGET_DIR secret}"
+            test -f "$APP_DIR/deploy.sh" || {
+              echo "deploy.sh not found in $APP_DIR; contents:" >&2
+              ls -la "$APP_DIR" >&2 || true
+              exit 1
+            }
+            bash "$APP_DIR/deploy.sh"
+
+        env:
+          APP_DIR: ${{ steps.cfg.outputs.dir }}
+          REGISTRY: ${{ env.REGISTRY }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BACKEND_IMAGE: ${{ needs.build.outputs.backend_image }}
+          FRONTEND_IMAGE: ${{ needs.build.outputs.frontend_image }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          POSTGRES_HOST_PORT: "5433"
+          BACKEND_HOST_PORT: "8000"
+          FRONTEND_HOST_PORT: "3000"
+          CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+          LOG_LEVEL: INFO
+
+      # Records exactly which image tags went out, visible on the run page.
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed to production"
+            echo ""
+            echo "| Service | Image |"
+            echo "| --- | --- |"
+            echo "| backend | \`${{ needs.build.outputs.backend_image }}\` |"
+            echo "| frontend | \`${{ needs.build.outputs.frontend_image }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

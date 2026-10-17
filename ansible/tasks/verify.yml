@@ -1,0 +1,20 @@
+- name: Backend /health returns ok
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ backend_host_port }}/health"
+    return_content: true
+  register: backend_health
+  until: backend_health.status | default(0) == 200 and (backend_health.json.status | default('')) == 'ok'
+  retries: 30
+  delay: 2
+
+- name: Frontend responds
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ frontend_host_port }}"
+  register: frontend_health
+  until: frontend_health.status | default(0) == 200
+  retries: 30
+  delay: 2
+
+- name: Frontend proxy reaches the backend
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ frontend_host_port }}/api/bio-records?limit=1"
