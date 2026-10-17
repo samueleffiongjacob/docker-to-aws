@@ -12,6 +12,7 @@ concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
 
+# packages: write is what lets GITHUB_TOKEN push images to GHCR.
 permissions:
   contents: read
   packages: write
@@ -23,7 +24,8 @@ jobs:
   build:
     name: Build & push images
     runs-on: ubuntu-latest
-
+    
+    # Image refs are computed once here and consumed by the deploy job below.
     outputs:
       backend_image: ${{ steps.images.outputs.backend }}
       frontend_image: ${{ steps.images.outputs.frontend }}
@@ -41,6 +43,8 @@ jobs:
           echo "frontend=${REGISTRY}/${repo}/frontend:${{ github.sha }}" >> "$GITHUB_OUTPUT"
           echo "repo=${repo}" >> "$GITHUB_OUTPUT"
 
+
+      # Buildx is required for the type=gha layer cache used by the build steps.
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -57,6 +61,8 @@ jobs:
           context: ./backend
           file: ./backend/Dockerfile
           push: true
+          # Immutable :sha tag is what the host deploys; :latest is a convenience
+          # pointer for humans pulling by hand.
           tags: |
             ${{ steps.images.outputs.backend }}
             ${{ env.REGISTRY }}/${{ steps.images.outputs.repo }}/backend:latest
@@ -79,6 +85,8 @@ jobs:
     name: Deploy to EC2
     needs: build
     runs-on: ubuntu-latest
+    
+    # Production environment scopes the deploy secrets and any required approval.
     environment: production
 
     steps:
@@ -86,6 +94,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Secrets pasted into the GitHub UI routinely pick up trailing newlines,
+      # which silently corrupt every path and host built from them. Strip them
+      # once here rather than debugging "$'/home/ubuntu/app\n\n\n'" later.
       # Strip stray newlines/whitespace that creep into pasted secrets.
       - name: Resolve deploy inputs
         id: cfg
@@ -121,23 +132,27 @@ jobs:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
           APP_DIR: ${{ steps.cfg.outputs.dir }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
           CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+          # Registry login: built-in token by default; add GHCR_USERNAME + GHCR_PAT
+          # secrets only if you want a long-lived token that works outside Actions.
+          GHCR_USER: ${{ secrets.GHCR_USERNAME || github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           umask 077
-          VAULT_FILE="$RUNNER_TEMP/vault-pass"
-          trap 'rm -f "$EC2_SSH_KEY_FILE" "$VAULT_FILE"' EXIT
-
+          trap 'rm -f "$EC2_SSH_KEY_FILE"' EXIT
           printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > "$EC2_SSH_KEY_FILE"
-          printf '%s' "$ANSIBLE_VAULT_PASSWORD" > "$VAULT_FILE"
 
           # Same lowercase owner/repo that the build job pushed to.
-          repo="${GITHUB_REPOSITORY,,}"
+          export IMAGE_REPO="${GITHUB_REPOSITORY,,}"
 
           # JSON extra-vars keep values with spaces/commas (CORS_ORIGINS) intact.
           extra="$(jq -nc \
             --arg tag "$GITHUB_SHA" \
-            --arg repo "$repo" \
+            --arg IMAGE_REPO "$IMAGE_REPO" \
             --arg dir "$APP_DIR" \
             --arg cors "$CORS_ORIGINS" \
             '{image_tag: $tag, image_repo: $repo, app_dir: $dir}
