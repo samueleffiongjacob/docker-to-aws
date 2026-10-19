@@ -1,0 +1,12 @@
+# EC2 (k3s). Non-secret settings only. The deploy playbook adds the image tags,
+# registry credentials, database password and CORS origins in a separate,
+# short-lived values file.
+imageCredentials:
+  enabled: true
+
+config:
+  logLevel: INFO
+
+postgres:
+  persistence:
+    size: 5Gi

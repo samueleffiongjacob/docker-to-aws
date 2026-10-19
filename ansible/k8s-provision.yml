@@ -1,0 +1,114 @@
+# Installs k3s (single-node Kubernetes) and Helm next to the existing Docker stack.
+# Safe to re-run: every step checks first.
+- name: Provision k3s and Helm
+  hosts: production
+  become: true
+  tags: [k8s-provision]
+  vars:
+    helm_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
+    helm_tarball: "helm-{{ helm_version }}-linux-{{ helm_arch }}.tar.gz"
+
+  tasks:
+    - name: Require Ubuntu
+      ansible.builtin.assert:
+        that: ansible_facts['distribution'] == 'Ubuntu'
+        fail_msg: This playbook targets Ubuntu EC2 images.
+
+    - name: Enough memory for Docker stack + k3s?
+      ansible.builtin.assert:
+        that: ansible_facts['memtotal_mb'] >= 1700
+        fail_msg: >-
+          This host has {{ ansible_facts['memtotal_mb'] }} MB RAM. k3s needs roughly 1 GB on top of
+          the running Docker stack; use at least a 2 GB instance (t3.small or larger).
+
+    - name: Is k3s already installed?
+      ansible.builtin.stat:
+        path: "{{ k3s_bin }}"
+      register: k3s_stat
+
+    # servicelb binds the frontend/backend ports on the node. If something else
+    # already owns them the pods would sit in Pending, so check before installing.
+    - name: Check the Kubernetes ports are free
+      ansible.builtin.shell: ss -ltnH "( sport = :{{ k8s_frontend_port }} or sport = :{{ k8s_backend_port }} )"
+      register: port_check
+      changed_when: false
+      when: not k3s_stat.stat.exists
+
+    - name: Stop if those ports are taken
+      ansible.builtin.assert:
+        that: port_check.stdout | trim | length == 0
+        fail_msg: "Port {{ k8s_frontend_port }} or {{ k8s_backend_port }} is already in use on this host. Pick other ports (K8S_FRONTEND_PORT / K8S_BACKEND_PORT)."
+        quiet: true
+      when: not k3s_stat.stat.exists
+
+    - name: Download the k3s installer
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /usr/local/sbin/k3s-install.sh
+        mode: "0700"
+      when: not k3s_stat.stat.exists
+
+    # Traefik is skipped (ports 80/443 stay free; the app is exposed by servicelb on
+    # its own ports). The kubeconfig stays root-only (default mode 0600).
+    - name: Install k3s
+      ansible.builtin.command: /usr/local/sbin/k3s-install.sh
+      environment:
+        INSTALL_K3S_CHANNEL: "{{ k3s_channel }}"
+        INSTALL_K3S_EXEC: "server --disable traefik"
+      args:
+        creates: "{{ k3s_bin }}"
+
+    - name: Wait for the node to be Ready
+      ansible.builtin.command: "{{ k3s_bin }} kubectl wait --for=condition=Ready node --all --timeout=60s"
+      register: node_ready
+      until: node_ready.rc == 0
+      retries: 6
+      delay: 10
+      changed_when: false
+
+    - name: Which Helm is installed?
+      ansible.builtin.command: /usr/local/bin/helm version --short
+      register: helm_now
+      changed_when: false
+      failed_when: false
+
+    - name: Install Helm
+      when: helm_version not in (helm_now.stdout | default(''))
+      block:
+        - name: Download Helm (checksum-verified)
+          ansible.builtin.get_url:
+            url: "https://get.helm.sh/{{ helm_tarball }}"
+            dest: "/tmp/{{ helm_tarball }}"
+            checksum: "sha256:https://get.helm.sh/{{ helm_tarball }}.sha256sum"
+            mode: "0644"
+
+        - name: Create a version-specific unpack directory
+          ansible.builtin.file:
+            path: "/tmp/helm-{{ helm_version }}"
+            state: directory
+            mode: "0755"
+
+        - name: Unpack Helm
+          ansible.builtin.unarchive:
+            src: "/tmp/{{ helm_tarball }}"
+            dest: "/tmp/helm-{{ helm_version }}"
+            remote_src: true
+            creates: "/tmp/helm-{{ helm_version }}/linux-{{ helm_arch }}/helm"
+
+        - name: Put the helm binary on the PATH
+          ansible.builtin.copy:
+            src: "/tmp/helm-{{ helm_version }}/linux-{{ helm_arch }}/helm"
+            dest: /usr/local/bin/helm
+            mode: "0755"
+            remote_src: true
+
+    - name: Show versions
+      ansible.builtin.shell: |
+        {{ k3s_bin }} --version | head -1
+        /usr/local/bin/helm version --short
+      register: versions
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ versions.stdout_lines }}"

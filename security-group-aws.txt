@@ -1,0 +1,226 @@
+==============================================================================
+ AWS SECURITY GROUPS - HOW TO OPEN PORTS FOR MY EC2 APP
+ (security-group-aws.txt)
+==============================================================================
+
+My setup this note was written for
+----------------------------------
+- One Ubuntu EC2 server running Docker Compose (project name: biodata)
+- frontend  -> port 3000   (public website)
+- backend   -> port 8000   (API, /health)
+- postgres  -> port 5433   (bound to 127.0.0.1, private, NEVER open this)
+- SSH       -> port 22     (me + GitHub Actions runners use it to deploy)
+- Deployed by GitHub Actions + Ansible (site.yml = provision + deploy)
+
+
+1. WHAT A SECURITY GROUP IS
+---------------------------
+A security group is AWS's firewall for an EC2 instance. It sits OUTSIDE the
+server, so traffic that is not allowed never reaches it.
+
+Key facts:
+- Default is DENY. A port is closed until a rule opens it.
+- Rules only ALLOW. There are no "deny" rules (that is what Network ACLs do).
+- INBOUND = traffic coming to the server. OUTBOUND = traffic leaving it.
+  I almost only edit INBOUND. Outbound allows everything by default, which
+  the server needs to pull Docker images and apt packages.
+- STATEFUL: if a request is allowed in, the reply is allowed out
+  automatically. No extra outbound rule is needed.
+- Changes apply immediately. No restart needed.
+- One security group can be attached to many instances, and one instance can
+  have several groups (rules are added together).
+
+How to recognise the problem:
+- Connection TIMED OUT  -> the security group (or network ACL) is blocking it.
+- Connection REFUSED    -> the network is open, but nothing listens on that
+                           port (container down, wrong port).
+  A timeout with healthy containers = security group. Always.
+
+
+2. WHY ufw DOES NOT MATTER HERE
+-------------------------------
+- Docker publishes ports by writing its own iptables rules, which skip ufw.
+  So ufw would not block 3000/8000 even if it were switched on.
+- ufw is inactive on this server and that is fine.
+- The security group is the real firewall.
+- If I ever enable ufw, run `sudo ufw allow 22/tcp` FIRST or I lock myself
+  out of SSH.
+
+
+3. RULES MY APP NEEDS (INBOUND)
+-------------------------------
+  Type        Protocol  Port  Source               Why
+  ----------  --------  ----  -------------------  -------------------------
+  SSH         TCP       22    0.0.0.0/0            GitHub runners have no
+                                                   fixed IP, so it must be
+                                                   open. Safe ONLY because
+                                                   login is key-only.
+  Custom TCP  TCP       3000  0.0.0.0/0            Public website
+  Custom TCP  TCP       8000  see section 4        Backend API (optional)
+  (none)      -         5433  NOT OPENED           Postgres is private
+
+Optional later:
+  HTTP   TCP 80   0.0.0.0/0   (when I add a domain / reverse proxy)
+  HTTPS  TCP 443  0.0.0.0/0   (when I add a domain with SSL)
+
+
+4. SHOULD PORT 8000 BE OPEN?
+----------------------------
+Choose one:
+
+ a) Open to anywhere (0.0.0.0/0)
+    Use when browsers or other clients must call the backend directly.
+
+ b) Open to my IP only (Source = "My IP")
+    Use when I only want to test the API myself. Safer.
+    Remember: my home/ISP IP can change, then I must update the rule.
+
+ c) Keep closed
+    Use when the frontend proxies everything through /api. The frontend
+    container talks to the backend over the internal Docker network, so the
+    browser never needs port 8000.
+    Test: open http://<server-ip>:3000/api/bio-records?limit=1
+    If it returns JSON, I do not need 8000 open to the public.
+
+
+5. STEP BY STEP IN THE AWS CONSOLE
+----------------------------------
+ 1. Open the AWS console -> EC2 -> Instances.
+ 2. Click my instance.
+ 3. Open the "Security" tab.
+ 4. Under "Security groups" click the group link (sg-xxxxxxxx).
+ 5. Click "Edit inbound rules".
+ 6. Click "Add rule" for each port:
+      Type   = Custom TCP
+      Port   = 3000   (then repeat for 8000 if wanted)
+      Source = Anywhere-IPv4 (0.0.0.0/0)   or   My IP
+      Description = something clear, e.g. "frontend public"
+ 7. Click "Save rules".
+ 8. Test (section 8).
+
+Tips:
+- Always fill the Description field. Future me will thank me.
+- IPv6: if I want IPv6 access too, add a second rule with ::/0.
+- Source can also be another security group (sg-...) for server-to-server
+  access, which is better than IP addresses inside AWS.
+
+
+6. SAME THING WITH THE AWS CLI
+------------------------------
+Find the security group of the instance (replace the IP):
+
+  aws ec2 describe-instances \
+    --filters "Name=ip-address,Values=<SERVER_PUBLIC_IP>" \
+    --query "Reservations[].Instances[].SecurityGroups[].GroupId" \
+    --output text
+
+Open ports (replace sg-xxxx):
+
+  aws ec2 authorize-security-group-ingress --group-id sg-xxxx \
+    --protocol tcp --port 3000 --cidr 0.0.0.0/0
+
+  aws ec2 authorize-security-group-ingress --group-id sg-xxxx \
+    --protocol tcp --port 8000 --cidr <MY_IP>/32
+
+Remove a rule:
+
+  aws ec2 revoke-security-group-ingress --group-id sg-xxxx \
+    --protocol tcp --port 8000 --cidr 0.0.0.0/0
+
+List current rules:
+
+  aws ec2 describe-security-groups --group-ids sg-xxxx \
+    --query "SecurityGroups[].IpPermissions"
+
+CIDR cheat sheet:
+  0.0.0.0/0        = anyone on the internet
+  1.2.3.4/32       = exactly one IP address (my IP)
+  10.0.0.0/16      = a whole private network range
+
+
+7. THINGS I MUST NOT DO
+-----------------------
+- Do NOT open 5433 (Postgres). It is bound to 127.0.0.1 on purpose.
+- Do NOT remove or restrict port 22 to my own IP. GitHub Actions runners
+  use changing IPs, so deploys would start timing out.
+- Do NOT open "All traffic" or "All TCP" to 0.0.0.0/0.
+- Do NOT rely on ufw to protect Docker ports (it does not).
+- Do NOT leave old test rules open. Delete rules I no longer use.
+
+
+8. HOW TO TEST AFTER SAVING
+---------------------------
+From MY COMPUTER (not the server):
+
+  curl -i --max-time 8 http://<SERVER_PUBLIC_IP>:3000
+  curl -i --max-time 8 http://<SERVER_PUBLIC_IP>:8000/health
+
+Expected:
+  - a response (200 / JSON with "status":"ok") = port is open
+  - "Connection timed out"                      = still blocked
+
+On the SERVER (checks the app itself, ignoring the firewall):
+
+  curl -i http://localhost:3000
+  docker ps          # containers should say (healthy)
+
+If it works on the server but not from outside -> network problem, not app.
+
+
+9. IF IT STILL TIMES OUT AFTER SAVING
+-------------------------------------
+ 1. Wrong group: the instance may use a different security group than the
+    one I edited. Check the Security tab ON THE INSTANCE.
+ 2. Network ACL: VPC -> Network ACLs -> the one on the instance's subnet.
+    It must allow inbound 3000/8000 and outbound ephemeral ports 1024-65535.
+    The default ACL allows everything.
+ 3. Wrong IP: the public IP changes when the instance is stopped and started
+    (unless it has an Elastic IP). Re-check it in the console.
+ 4. Rule typo: protocol must be TCP, port number correct, source correct.
+ 5. Container not listening: `docker ps` and `docker compose logs --tail=50`.
+ 6. Local network: some office/school/mobile networks block unusual ports.
+    Try from a phone on mobile data to compare.
+
+
+10. GOOD HABITS
+---------------
+- Allocate an ELASTIC IP and attach it to the instance, so the address, the
+  EC2_HOST secret and CORS_ORIGINS never go stale after a stop/start.
+- Put a domain + HTTPS in front later, then open 80/443 and consider closing
+  3000/8000 to the public.
+- When the public address changes, update these GitHub secrets:
+    EC2_HOST
+    CORS_ORIGINS   (e.g. http://<ip>:3000,http://localhost:3000)
+- Name security groups clearly, e.g. "biodata-prod-sg".
+- Review rules now and then and delete anything unused.
+
+
+11. KUBERNETES (k3s) PORTS - RUNS NEXT TO DOCKER
+------------------------------------------------
+The Kubernetes copy of the app runs on the same server beside the Docker stack,
+so it uses DIFFERENT ports:
+
+  Port  Used by                       Open in the security group?
+  ----  ----------------------------  ----------------------------------------
+  3000  Docker frontend               yes (already)
+  8000  Docker backend                optional (already)
+  3300  Kubernetes frontend           YES - add Custom TCP 3300, 0.0.0.0/0
+  8300  Kubernetes backend            only if browsers call the API directly
+  6443  Kubernetes API (k3s)          NO - keep closed
+  5433  Docker Postgres (loopback)    NO
+        Kubernetes Postgres           not published at all
+
+Steps are the same as section 5: EC2 -> Instance -> Security -> group ->
+Edit inbound rules -> Add rule -> Custom TCP -> 3300 -> Save.
+Test: curl -i --max-time 8 http://<SERVER_PUBLIC_IP>:3300
+
+Locally the same ports (3300 / 8300) are used, which avoids 3000, 8000, 8001 and
+8080 on my machine.
+
+
+QUICK SUMMARY
+-------------
+ Containers healthy + connection timed out  ==>  open the port in the
+ security group (EC2 -> Instances -> Security -> group -> Edit inbound rules
+ -> Add rule -> Custom TCP -> port -> source -> Save).
+==============================================================================

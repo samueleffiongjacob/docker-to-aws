@@ -1,0 +1,26 @@
+# Managed by Ansible, written with mode 0600 and deleted after the deploy.
+images:
+  backend:
+    repository: {{ backend_image | to_json }}
+    tag: {{ image_tag | string | to_json }}
+  frontend:
+    repository: {{ frontend_image | to_json }}
+    tag: {{ image_tag | string | to_json }}
+imageCredentials:
+  enabled: true
+  registry: {{ registry | to_json }}
+  username: {{ ghcr_user | to_json }}
+  password: {{ ghcr_token | to_json }}
+auth:
+  username: {{ postgres_user | to_json }}
+  password: {{ postgres_password | to_json }}
+  database: {{ postgres_db | to_json }}
+config:
+  corsOrigins: {{ k8s_cors_origins | trim | to_json }}
+  logLevel: {{ log_level | to_json }}
+backend:
+  service:
+    port: {{ k8s_backend_port | int }}
+frontend:
+  service:
+    port: {{ k8s_frontend_port | int }}

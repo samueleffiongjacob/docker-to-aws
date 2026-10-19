@@ -22,3 +22,24 @@ log_level: "{{ lookup('env', 'LOG_LEVEL') | default('INFO', true) }}"
 
 backend_image: "{{ registry }}/{{ image_repo }}/backend"
 frontend_image: "{{ registry }}/{{ image_repo }}/frontend"
+
+# ============================================================================
+# Kubernetes (k3s + Helm). Runs ALONGSIDE the Docker stack on the same host, so
+# it uses its own ports: Docker keeps 3000/8000/5433, Kubernetes uses 3300/8300.
+# ============================================================================
+k8s_dir: "{{ app_dir }}/k8s"
+k8s_chart_dir: "{{ k8s_dir }}/chart"
+k8s_namespace: biodata
+k8s_release: biodata
+
+k3s_channel: stable
+helm_version: v3.18.3
+k3s_bin: /usr/local/bin/k3s
+kubeconfig_path: /etc/rancher/k3s/k3s.yaml
+
+k8s_frontend_port: "{{ lookup('env', 'K8S_FRONTEND_PORT') | default('3300', true) }}"
+k8s_backend_port: "{{ lookup('env', 'K8S_BACKEND_PORT') | default('8300', true) }}"
+# Browser origins for the Kubernetes frontend. Falls back to http://<EC2_HOST>:<frontend port>.
+k8s_cors_origins: >-
+  {{ lookup('env', 'K8S_CORS_ORIGINS')
+     | default('http://' ~ lookup('env', 'EC2_HOST') ~ ':' ~ k8s_frontend_port ~ ',http://localhost:' ~ k8s_frontend_port, true) }}

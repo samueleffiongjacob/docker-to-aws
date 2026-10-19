@@ -1,0 +1,132 @@
+name: Deploy to Kubernetes (k3s on EC2)
+
+# Separate from "Deploy to EC2" (Docker Compose). The two stacks run side by side:
+# Docker on 3000/8000, Kubernetes on 3300/8300. Images are the SAME ones built by
+# the Docker workflow, so this workflow never builds anything.
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (a commit SHA that 'Deploy to EC2' already built). Empty = this commit."
+        required: false
+        default: ""
+  # Optional automation: after a successful Docker deploy, deploy the same commit
+  # to Kubernetes too. Off unless the repo variable K8S_AUTO_DEPLOY is "true".
+  workflow_run:
+    workflows: ["Deploy to EC2"]
+    types: [completed]
+
+concurrency:
+  group: deploy-k8s
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  deploy:
+    name: Helm deploy on k3s
+    runs-on: ubuntu-latest
+    environment: production
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && vars.K8S_AUTO_DEPLOY == 'true')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve image tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.image_tag }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          THIS_SHA: ${{ github.sha }}
+        run: |
+          tag="${INPUT_TAG:-${RUN_SHA:-$THIS_SHA}}"
+          if ! [[ "$tag" =~ ^[A-Za-z0-9_.-]{1,128}$ ]]; then
+            echo "::error title=Bad image tag::'$tag' is not a valid image tag"
+            exit 1
+          fi
+          echo "value=$tag" >> "$GITHUB_OUTPUT"
+
+      # Strip stray newlines/whitespace that creep into pasted secrets.
+      - name: Resolve deploy inputs
+        id: cfg
+        env:
+          RAW_DIR: ${{ secrets.EC2_TARGET_DIR }}
+          RAW_HOST: ${{ secrets.EC2_HOST }}
+          RAW_USER: ${{ secrets.EC2_USERNAME }}
+          RAW_PORT: ${{ secrets.EC2_PORT }}
+        run: |
+          clean() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          dir="$(clean "$RAW_DIR")"
+          {
+            echo "dir=${dir:-/home/ubuntu/app}"
+            echo "host=$(clean "$RAW_HOST")"
+            echo "user=$(clean "$RAW_USER")"
+            echo "port=$(clean "$RAW_PORT")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install Ansible
+        run: |
+          pipx install ansible-core   # already on the runner image; no-op if present
+          ansible-galaxy collection install -r ansible/requirements.yml
+          ansible --version | head -1
+
+      - name: Provision k3s + Helm (if needed) and deploy the chart
+        working-directory: ansible
+        env:
+          EC2_HOST: ${{ steps.cfg.outputs.host }}
+          EC2_USERNAME: ${{ steps.cfg.outputs.user }}
+          EC2_PORT: ${{ steps.cfg.outputs.port }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_SSH_KEY_FILE: ${{ runner.temp }}/key.pem
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          APP_DIR: ${{ steps.cfg.outputs.dir }}
+          IMAGE_TAG: ${{ steps.tag.outputs.value }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          # Optional. Default: http://<EC2_HOST>:3300,http://localhost:3300
+          K8S_CORS_ORIGINS: ${{ secrets.K8S_CORS_ORIGINS || vars.K8S_CORS_ORIGINS }}
+          # Registry login for the cluster's pull secret. A long-lived GHCR_PAT is
+          # recommended: the built-in token dies after the run, so pods that restart
+          # later could not pull a missing image.
+          GHCR_USER: ${{ secrets.GHCR_USERNAME || github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          trap 'rm -f "$EC2_SSH_KEY_FILE"' EXIT
+
+          missing=""
+          for v in EC2_HOST EC2_USERNAME EC2_SSH_KEY POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB GHCR_TOKEN; do
+            [ -n "${!v:-}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=Missing secrets::These are empty:$missing. Add them under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > "$EC2_SSH_KEY_FILE"
+          export IMAGE_REPO="${GITHUB_REPOSITORY,,}"
+
+          # k8s-site.yml = k8s-provision.yml (k3s + Helm, idempotent) then k8s-deploy.yml
+          ansible-playbook k8s-site.yml -e "image_tag=$IMAGE_TAG"
+
+      - name: Summary
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+          HOST: ${{ steps.cfg.outputs.host }}
+        run: |
+          {
+            echo "### Deployed to Kubernetes (k3s)"
+            echo ""
+            echo "- image tag: \`$TAG\`"
+            echo "- frontend: http://$HOST:3300"
+            echo "- backend health: http://$HOST:8300/health"
+          } >> "$GITHUB_STEP_SUMMARY"

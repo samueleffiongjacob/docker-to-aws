@@ -1,0 +1,13 @@
+{{- if .Values.imageCredentials.enabled }}
+{{- $u := required "imageCredentials.username is required" .Values.imageCredentials.username }}
+{{- $p := required "imageCredentials.password is required" .Values.imageCredentials.password }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "biodata.fullname" . }}-regcred
+  labels:
+    {{- include "biodata.labels" . | nindent 4 }}
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: {{ dict "auths" (dict .Values.imageCredentials.registry (dict "username" $u "password" $p "auth" (printf "%s:%s" $u $p | b64enc))) | toJson | b64enc }}
+{{- end }}

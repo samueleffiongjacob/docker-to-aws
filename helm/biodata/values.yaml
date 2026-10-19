@@ -1,0 +1,77 @@
+# Defaults are safe for a throwaway local cluster. Real values come from
+# values-local.yaml / values-ec2.yaml plus a deploy-time file for secrets.
+
+nameOverride: ""
+fullnameOverride: ""
+
+images:
+  backend:
+    repository: biodata-backend
+    tag: local
+    pullPolicy: IfNotPresent
+  frontend:
+    repository: biodata-frontend
+    tag: local
+    pullPolicy: IfNotPresent
+  postgres:
+    repository: postgres
+    tag: 16-alpine
+    pullPolicy: IfNotPresent
+
+# Pull secret for a private registry (GHCR). Never commit real values.
+imageCredentials:
+  enabled: false
+  registry: ghcr.io
+  username: ""
+  password: ""
+
+# Database credentials. password has no default on purpose: the chart refuses to
+# render without one, so a production deploy can never fall back to "biodata".
+auth:
+  username: biodata
+  password: ""
+  database: biodata
+
+config:
+  # Comma-separated browser origins allowed to call the backend.
+  corsOrigins: "http://localhost:3300"
+  logLevel: INFO
+
+backend:
+  replicas: 1
+  containerPort: 8000
+  service:
+    type: LoadBalancer      # k3s' built-in servicelb binds this port on the node
+    port: 8300              # host-facing port. 8000/8001/8080 are taken locally.
+    nodePort: null          # only used when type is NodePort (30000-32767)
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 1Gi }
+
+frontend:
+  replicas: 1
+  containerPort: 3000
+  service:
+    type: LoadBalancer
+    port: 3300              # 3000 is taken locally and by the Docker stack on EC2
+    nodePort: null
+  resources:
+    requests: { cpu: 25m, memory: 96Mi }
+    limits: { memory: 512Mi }
+
+postgres:
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: ""        # "" = cluster default (k3s: local-path)
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 1Gi }
+
+# Optional: serve the frontend through an Ingress instead of the LoadBalancer port.
+ingress:
+  enabled: false
+  className: ""
+  host: biodata.example.com
+  annotations: {}
+  tls: []

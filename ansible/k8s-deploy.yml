@@ -1,0 +1,138 @@
+# Deploys the Helm chart to k3s. Independent of the Docker deploy.
+#   ansible-playbook k8s-deploy.yml -e image_tag=<git-sha>
+- name: Deploy to Kubernetes (Helm)
+  hosts: production
+  become: true
+  tags: [k8s-deploy]
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+
+  tasks:
+    - name: Require an image tag (the commit SHA built by CI)
+      ansible.builtin.assert:
+        that: image_tag is defined and (image_tag | string) | length > 0
+        fail_msg: "Pass -e image_tag=<git sha>"
+
+    - name: Work out which required settings are empty
+      ansible.builtin.set_fact:
+        missing_settings: >-
+          {{ {'IMAGE_REPO': image_repo, 'POSTGRES_USER': postgres_user,
+              'POSTGRES_PASSWORD': postgres_password, 'POSTGRES_DB': postgres_db,
+              'GHCR_USER': ghcr_user, 'GHCR_TOKEN': ghcr_token}
+             | dict2items | selectattr('value', 'equalto', '') | map(attribute='key') | list }}
+      no_log: true
+
+    - name: Stop if a setting is empty
+      ansible.builtin.assert:
+        that: missing_settings | length == 0
+        fail_msg: "Empty settings: {{ missing_settings | join(', ') }}. Add them as repo secrets (names must match exactly)."
+        quiet: true
+
+    - name: Are k3s and Helm installed?
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: ["{{ k3s_bin }}", /usr/local/bin/helm]
+      register: tools
+
+    - name: Stop with a clear message if the host isn't ready
+      ansible.builtin.assert:
+        that: tools.results | map(attribute='stat.exists') | min
+        fail_msg: k3s or Helm is missing. Run k8s-provision.yml once, then deploy again.
+        quiet: true
+
+    - name: Make sure the chart directory is clean
+      ansible.builtin.file:
+        path: "{{ k8s_chart_dir }}"
+        state: absent
+
+    - name: Copy the chart
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../helm/biodata/"
+        dest: "{{ k8s_chart_dir }}/"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: preserve
+
+    - name: Release
+      block:
+        - name: Write the short-lived values file (secrets inside)
+          ansible.builtin.template:
+            src: k8s-values.yaml.j2
+            dest: "{{ k8s_dir }}/values-deploy.yaml"
+            mode: "0600"
+            owner: root
+          no_log: true
+
+        - name: helm upgrade --install
+          ansible.builtin.command: >-
+            /usr/local/bin/helm upgrade --install {{ k8s_release }} {{ k8s_chart_dir }}
+            --namespace {{ k8s_namespace }} --create-namespace
+            -f {{ k8s_chart_dir }}/values.yaml
+            -f {{ k8s_chart_dir }}/values-ec2.yaml
+            -f {{ k8s_dir }}/values-deploy.yaml
+            --wait --timeout 10m
+          register: helm_run
+
+        - name: Backend /health through the Kubernetes port
+          ansible.builtin.uri:
+            url: "http://{{ ansible_facts['default_ipv4']['address'] }}:{{ k8s_backend_port }}/health"
+            return_content: true
+          register: k8s_backend_health
+          until: k8s_backend_health.status | default(0) == 200 and (k8s_backend_health.json.status | default('')) == 'ok'
+          retries: 30
+          delay: 2
+
+        - name: Frontend through the Kubernetes port
+          ansible.builtin.uri:
+            url: "http://{{ ansible_facts['default_ipv4']['address'] }}:{{ k8s_frontend_port }}"
+          register: k8s_frontend_health
+          until: k8s_frontend_health.status | default(0) == 200
+          retries: 30
+          delay: 2
+
+        - name: Frontend proxy reaches the backend
+          ansible.builtin.uri:
+            url: "http://{{ ansible_facts['default_ipv4']['address'] }}:{{ k8s_frontend_port }}/api/bio-records?limit=1"
+
+        - name: Show the release
+          ansible.builtin.command: /usr/local/bin/helm status {{ k8s_release }} -n {{ k8s_namespace }}
+          register: helm_status
+          changed_when: false
+
+        - name: Report
+          ansible.builtin.debug:
+            msg: "{{ helm_status.stdout_lines }}"
+
+      rescue:
+        - name: Collect diagnostics
+          ansible.builtin.shell: |
+            {{ k3s_bin }} kubectl -n {{ k8s_namespace }} get pods -o wide
+            echo "--- recent events"
+            {{ k3s_bin }} kubectl -n {{ k8s_namespace }} get events --sort-by=.lastTimestamp | tail -25
+            echo "--- backend logs"
+            {{ k3s_bin }} kubectl -n {{ k8s_namespace }} logs deploy/{{ k8s_release }}-backend --tail=80 2>&1 || true
+            echo "--- frontend logs"
+            {{ k3s_bin }} kubectl -n {{ k8s_namespace }} logs deploy/{{ k8s_release }}-frontend --tail=40 2>&1 || true
+          register: k8s_diag
+          changed_when: false
+          failed_when: false
+
+        - name: Show diagnostics
+          ansible.builtin.debug:
+            msg: "{{ k8s_diag.stdout_lines | default([]) }}"
+
+        # With a previous good revision this returns the cluster to it; on a first
+        # install there is nothing to roll back to, so the error is ignored.
+        - name: Roll back to the previous revision
+          ansible.builtin.command: /usr/local/bin/helm rollback {{ k8s_release }} -n {{ k8s_namespace }} --wait --timeout 5m
+          failed_when: false
+
+        - name: Fail the deploy
+          ansible.builtin.fail:
+            msg: "Kubernetes deploy of {{ image_tag }} failed; see the diagnostics above. A previous revision was restored if one existed."
+
+      always:
+        - name: Remove the values file (it holds secrets)
+          ansible.builtin.file:
+            path: "{{ k8s_dir }}/values-deploy.yaml"
+            state: absent

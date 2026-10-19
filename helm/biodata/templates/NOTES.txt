@@ -1,0 +1,13 @@
+Biodata is deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Frontend : http://<node-address>:{{ .Values.frontend.service.port }}
+Backend  : http://<node-address>:{{ .Values.backend.service.port }}/health
+{{- if eq .Values.frontend.service.type "ClusterIP" }}
+
+Services are ClusterIP only. Reach them with:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "biodata.fullname" . }}-frontend {{ .Values.frontend.service.port }}:{{ .Values.frontend.service.port }}
+{{- end }}
+
+Check the pods:
+  kubectl -n {{ .Release.Namespace }} get pods
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "biodata.fullname" . }}-backend

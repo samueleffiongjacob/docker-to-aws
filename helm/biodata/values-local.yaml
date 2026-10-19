@@ -1,0 +1,24 @@
+# Local cluster (k3s or minikube). Images are built on this machine and loaded
+# into the cluster, so they are never pulled. Dev-only credentials: never use in production.
+images:
+  backend:
+    repository: biodata-backend
+    tag: local
+    pullPolicy: Never
+  frontend:
+    repository: biodata-frontend
+    tag: local
+    pullPolicy: Never
+
+auth:
+  username: biodata
+  password: biodata-local-dev
+  database: biodata
+
+config:
+  corsOrigins: "http://localhost:3300,http://127.0.0.1:3300,http://localhost:13300,http://127.0.0.1:13300"
+  logLevel: DEBUG
+
+postgres:
+  persistence:
+    size: 1Gi
