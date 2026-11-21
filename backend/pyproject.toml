@@ -5,14 +5,14 @@ description = "Biodata records service"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
-    "sqlalchemy>=2.0",
-    "psycopg[binary]>=3.2",
-    "alembic>=1.13",
-    "pydantic>=2.7",
-    "pydantic-settings>=2.3",
-    "email-validator>=2.1",
+    "fastapi>=0.163.2",
+    "uvicorn[standard]>=0.54.0",
+    "sqlalchemy>=2.1.9",
+    "psycopg[binary]>=3.3.9",
+    "alembic>=1.20.1",
+    "pydantic>=2.14.3",
+    "pydantic-settings>=2.16.3",
+    "email-validator>=2.4.0",
 ]
 
 [project.scripts]
